@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <stdio.h>
+#include <vector>
 
 using namespace nvcuda;
 using bf16 = __nv_bfloat16;
@@ -224,16 +225,46 @@ __global__ void GemmBf16TensorShape128x128x8(const bf16* a, const bf16* b, int m
     c[row * 128 + col] = __float2bfloat16(sum);
 }
 
+/* warp structure
+ *
+ * 
+ * 
+ * 
+ *    |  128  |
+ * ---|-------|-------|
+ * 64 | warp0 | warp1 |
+ * --------------------
+ *    | warp2 | warp3 |
+ *    ----------------
+ *    | warp4 | warp5 |
+ *    -----------------
+ *    | warp6 | warp7 |
+ *    -----------------
+ */
+
+ /* 
+  * ------------------------------------------------------------------------------------------------------------------
+  * |  t0  |  t1  |  t2  |  t3  |  t4  |  t5  |  t6  |  t7  ||  t0  |  ...                                           |
+  * |  t8  |  t9  |  t10 |  t11 |  t12 |  t13 |  t14 |  t15 ||  t8  |  ...                                           |
+  * |  t16 |  t17 |  t18 |  t19 |  t20 |  t21 |  t22 |  t23 ||  t16 |  ...                                           |
+  * |  t24 |  t25 |  t26 |  t27 |  t28 |  t29 |  t30 |  t31 ||  t24 |  ...                                           |
+  * |-------------------------------------------------------||--------------------------------------------------------
+  * |  t0  |  ...                                           ||  t0  |  ...                                           |
+  * |  t8  |  ...                                           ||  t8  |  ...                                           |
+  * |  t16 |  ...                                           ||  t16 |  ...                                           |
+  * |  t24 |  ...                                           ||  t24 |  ...                                           |
+  * ------------------------------------------------------------------------------------------------------------------
+  */
 template<int METHOD, bool VECTORIZATION, bool ASYNC_LOAD>
 __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int n, int k, float* c)
 {
-    constexpr int TILE_M = 128;
+    constexpr int TILE_M = 256;
     constexpr int TILE_E = TILE_M + 4;
-    constexpr int TILE_N = 128;
+    constexpr int TILE_N = 256;
     constexpr int TILE_K = 8;
     __shared__ __align__(16 * 1024) char smem[24 * 1024];
-    float* a_smem = reinterpret_cast<float*>(smem);  // 1024 * 8
-    float* b_smem = reinterpret_cast<float*>(smem + 16 * 1024);
+    bf16* a_smem = reinterpret_cast<bf16*>(smem);  // 1024 * 8
+    bf16* b_smem = reinterpret_cast<bf16*>(smem + 16 * 1024);
 
     int block_x = blockIdx.y;
     int block_y = blockIdx.x;
@@ -254,27 +285,27 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 
     if constexpr (METHOD == 0)
     {
-        a_ldg_addr_base = (block_x * TILE_M) * k + warp_id * 16 * k + ((lane_id / 8) * 4) * k + (lane_id % 8);
+        a_ldg_addr_base = (block_x * TILE_M) * k + warp_id * 32 * k + ((lane_id / 4) * 4) * k + (lane_id % 4) * 2;
         if constexpr (VECTORIZATION)
         {
-            b_ldg_addr_base = (block_y * TILE_N) + (warp_id * n) + lane_id * 4;
+            b_ldg_addr_base = (block_y * TILE_N) + (warp_id * n) + lane_id * 8;
         }
         else
         {
-            b_ldg_addr_base = (block_y * TILE_N) + (warp_id * n) + lane_id;
+            b_ldg_addr_base = (block_y * TILE_N) + (warp_id * n) + lane_id * 2;
         }
-        c_stg_addr_base = (block_x * TILE_M) * n + (block_y * TILE_N) + (warp_id / 2) * 32 * n + (warp_id % 2) * 64 + (lane_id / 8) * 4 * n + (lane_id % 8) * 4;
+        c_stg_addr_base = (block_x * TILE_M * 2) * n * 2 + (block_y * TILE_N * 2) + (warp_id / 2) * 64 * n * 2 + (warp_id % 2) * 128 + (lane_id / 8) * 8 * n * 2 + (lane_id % 8) * 8;
 
-        a_lds_addr_base = SMemPtr2Addr(a_smem + (warp_id / 2) * 32 + (lane_id / 8) * 4);
-        b_lds_addr_base = SMemPtr2Addr(b_smem + (warp_id % 2) * 64 + (lane_id % 8) * 4);
-        a_sts_addr_base = SMemPtr2Addr(a_smem + warp_id * 16 + (lane_id / 8) * 4 + (lane_id % 8) * TILE_E);
+        a_lds_addr_base = SMemPtr2Addr(a_smem + (warp_id / 2) * 64 + (lane_id / 8) * 8);
+        b_lds_addr_base = SMemPtr2Addr(b_smem + (warp_id % 2) * 128 + (lane_id % 8) * 8);
+        a_sts_addr_base = SMemPtr2Addr(a_smem + warp_id * 32 + (lane_id / 4) * 4 + (lane_id % 4) * 2 * TILE_E);
         if constexpr (VECTORIZATION)
         {
-            b_sts_addr_base = SMemPtr2Addr(b_smem + warp_id * TILE_N + lane_id * 4);
+            b_sts_addr_base = SMemPtr2Addr(b_smem + warp_id * TILE_N + lane_id * 8);
         }
         else
         {
-            b_sts_addr_base = SMemPtr2Addr(b_smem + warp_id * TILE_N + lane_id);
+            b_sts_addr_base = SMemPtr2Addr(b_smem + warp_id * TILE_N + lane_id * 2);
         }
     }
     else
@@ -288,7 +319,7 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
         {
             b_ldg_addr_base = (block_y * TILE_N) + (warp_id * n) + lane_id;
         }
-        c_stg_addr_base = (block_x * TILE_M) * n + (block_y * TILE_N) + (warp_id / 2) * 32 * n + (warp_id % 2) * 64 + ((lane_id / 16) * 8 + (lane_id % 2) * 4) * n + ((lane_id % 16) / 2) * 4;
+        c_stg_addr_base = (block_x * TILE_M) * n + (block_y * TILE_N) + (warp_id / 2) * 32 * n * 2 + (warp_id % 2) * 64 + ((lane_id / 16) * 8 + (lane_id % 2) * 4) * n * 2 + ((lane_id % 16) / 2) * 4;
 
         a_lds_addr_base = SMemPtr2Addr(a_smem + (warp_id / 2) * 32 + (lane_id / 16) * 8 + (lane_id % 2) * 4);
         b_lds_addr_base = SMemPtr2Addr(b_smem + (warp_id % 2) * 64 + ((lane_id % 16) / 2) * 4);
@@ -303,11 +334,11 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
         }
     }
 
-    float a_ldg_reg[4];
-    float b_ldg_reg[4];
+    bf162 a_ldg_reg[4];
+    bf162 b_ldg_reg[4];
 
-    float a_frag[2][8] = { 0.f };
-    float b_frag[2][8] = { 0.f };
+    bf162 a_frag[2][8] = { 0.f };
+    bf162 b_frag[2][8] = { 0.f };
     bf16 c_frag[16][16] = { __float2bfloat16(0.f) };
 
 #pragma unroll
@@ -346,13 +377,13 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
         {
             if constexpr (ASYNC_LOAD)
             {
-                Ldgsts32(b_sts_addr_base + i * 32 * sizeof(float), b + b_ldg_addr_base + i * 32);
+                Ldgsts32(b_sts_addr_base + i * 64 * sizeof(bf16), b + b_ldg_addr_base + i * 64);
             }
             else
             {
-                Ldg32(b_ldg_reg[i], b + b_ldg_addr_base + i * 32);
+                Ldg32(b_ldg_reg[i], b + b_ldg_addr_base + i * 64);
 
-                Sts32(b_ldg_reg[i], b_sts_addr_base + i * 32 * sizeof(float));
+                Sts32(b_ldg_reg[i], b_sts_addr_base + i * 64 * sizeof(bf16));
             }
         }
     }
@@ -367,9 +398,9 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
     __syncthreads();
 
     Lds128(a_frag[0][0], a_frag[0][1], a_frag[0][2], a_frag[0][3], a_lds_addr_base);
-    Lds128(a_frag[0][4], a_frag[0][5], a_frag[0][6], a_frag[0][7], a_lds_addr_base + 16 * sizeof(float));
+    Lds128(a_frag[0][4], a_frag[0][5], a_frag[0][6], a_frag[0][7], a_lds_addr_base + 32 * sizeof(bf16));
     Lds128(b_frag[0][0], b_frag[0][1], b_frag[0][2], b_frag[0][3], b_lds_addr_base);
-    Lds128(b_frag[0][4], b_frag[0][5], b_frag[0][6], b_frag[0][7], b_lds_addr_base + 32 * sizeof(float));
+    Lds128(b_frag[0][4], b_frag[0][5], b_frag[0][6], b_frag[0][7], b_lds_addr_base + 64 * sizeof(bf16));
 
     for (int tile = 1; tile < num_tiles; ++tile)
     {
@@ -409,11 +440,11 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
                     {
                         if constexpr (ASYNC_LOAD)
                         {
-                            Ldgsts32(b_sts_addr_base + i * 32 * sizeof(float), b + b_ldg_addr_base + i * 32 + tile * TILE_K * n);
+                            Ldgsts32(b_sts_addr_base + i * 64 * sizeof(bf16), b + b_ldg_addr_base + i * 64 + tile * TILE_K * n);
                         }
                         else
                         {
-                            Ldg32(b_ldg_reg[i], b + b_ldg_addr_base + i * 32 + tile * TILE_K * n);
+                            Ldg32(b_ldg_reg[i], b + b_ldg_addr_base + i * 64 + tile * TILE_K * n);
                         }
                     }
                 }
@@ -438,7 +469,7 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 #pragma unroll
                         for (int i = 0; i < 4; ++i)
                         {
-                            Sts32(b_ldg_reg[i], b_sts_addr_base + i * 32 * sizeof(float));
+                            Sts32(b_ldg_reg[i], b_sts_addr_base + i * 64 * sizeof(bf16));
                         }
                     }
                 }
@@ -454,13 +485,13 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 
             int frag_read_index = frag % 2;
             int frag_write_index = (frag + 1) % 2;
-            int a_lds_addr_offset = ((frag + 1) % TILE_K) * TILE_E * sizeof(float);
-            int b_lds_addr_offset = ((frag + 1) % TILE_K) * TILE_N * sizeof(float);
+            int a_lds_addr_offset = ((frag + 1) % TILE_K) * TILE_E * sizeof(bf162);
+            int b_lds_addr_offset = ((frag + 1) % TILE_K) * TILE_N * sizeof(bf162);
 
             Lds128(a_frag[frag_write_index][0], a_frag[frag_write_index][1], a_frag[frag_write_index][2], a_frag[frag_write_index][3], a_lds_addr_base + a_lds_addr_offset);
-            Lds128(a_frag[frag_write_index][4], a_frag[frag_write_index][5], a_frag[frag_write_index][6], a_frag[frag_write_index][7], a_lds_addr_base + 16 * sizeof(float) + a_lds_addr_offset);
+            Lds128(a_frag[frag_write_index][4], a_frag[frag_write_index][5], a_frag[frag_write_index][6], a_frag[frag_write_index][7], a_lds_addr_base + 32 * sizeof(bf16) + a_lds_addr_offset);
             Lds128(b_frag[frag_write_index][0], b_frag[frag_write_index][1], b_frag[frag_write_index][2], b_frag[frag_write_index][3], b_lds_addr_base + b_lds_addr_offset);
-            Lds128(b_frag[frag_write_index][4], b_frag[frag_write_index][5], b_frag[frag_write_index][6], b_frag[frag_write_index][7], b_lds_addr_base + 32 * sizeof(float) + b_lds_addr_offset);
+            Lds128(b_frag[frag_write_index][4], b_frag[frag_write_index][5], b_frag[frag_write_index][6], b_frag[frag_write_index][7], b_lds_addr_base + 64 * sizeof(bf16) + b_lds_addr_offset);
 
 #pragma unroll
             for (int i = 0; i < 8; ++i)
@@ -468,12 +499,13 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 #pragma unroll
                 for (int j = 0; j < 8; ++j)
                 {
-                    bf162 a_val = *reinterpret_cast<bf162*>(a_frag[frag_read_index] + i);
-                    bf162 b_val = *reinterpret_cast<bf162*>(b_frag[frag_read_index] + j);
-                    c_frag[2 * i + 0][2 * j + 0] = __hmul(a_val.x, b_val.x);
-                    c_frag[2 * i + 0][2 * j + 1] = __hmul(a_val.x, b_val.y);
-                    c_frag[2 * i + 1][2 * j + 0] = __hmul(a_val.y, b_val.x);
-                    c_frag[2 * i + 1][2 * j + 1] = __hmul(a_val.y, b_val.y);
+                    bf162 a_val = a_frag[frag_read_index] + i;
+                    bf162 b_val = b_frag[frag_read_index] + j;
+                   
+                    c_frag[2 * i + 0][2 * j + 0] = __hadd(c_frag[2 * i + 0][2 * j + 0], __hmul(a_val.x, b_val.x));
+                    c_frag[2 * i + 0][2 * j + 1] = __hadd(c_frag[2 * i + 0][2 * j + 1], __hmul(a_val.x, b_val.y));
+                    c_frag[2 * i + 1][2 * j + 0] = __hadd(c_frag[2 * i + 1][2 * j + 0], __hmul(a_val.y, b_val.x));
+                    c_frag[2 * i + 1][2 * j + 1] = __hadd(c_frag[2 * i + 1][2 * j + 1], __hmul(a_val.y, b_val.y));
                 }
             }
         }
@@ -487,13 +519,13 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
         if (frag < TILE_K - 1)
         {
             int frag_write_index = (frag + 1) % 2;
-            int a_lds_addr_offset = ((frag + 1) % TILE_K) * TILE_E * sizeof(float);
-            int b_lds_addr_offset = ((frag + 1) % TILE_K) * TILE_N * sizeof(float);
+            int a_lds_addr_offset = ((frag + 1) % TILE_K) * TILE_E * sizeof(bf162);
+            int b_lds_addr_offset = ((frag + 1) % TILE_K) * TILE_N * sizeof(bf162);
 
             Lds128(a_frag[frag_write_index][0], a_frag[frag_write_index][1], a_frag[frag_write_index][2], a_frag[frag_write_index][3], a_lds_addr_base + a_lds_addr_offset);
-            Lds128(a_frag[frag_write_index][4], a_frag[frag_write_index][5], a_frag[frag_write_index][6], a_frag[frag_write_index][7], a_lds_addr_base + 16 * sizeof(float) + a_lds_addr_offset);
+            Lds128(a_frag[frag_write_index][4], a_frag[frag_write_index][5], a_frag[frag_write_index][6], a_frag[frag_write_index][7], a_lds_addr_base + 32 * sizeof(bf16) + a_lds_addr_offset);
             Lds128(b_frag[frag_write_index][0], b_frag[frag_write_index][1], b_frag[frag_write_index][2], b_frag[frag_write_index][3], b_lds_addr_base + b_lds_addr_offset);
-            Lds128(b_frag[frag_write_index][4], b_frag[frag_write_index][5], b_frag[frag_write_index][6], b_frag[frag_write_index][7], b_lds_addr_base + 32 * sizeof(float) + b_lds_addr_offset);
+            Lds128(b_frag[frag_write_index][4], b_frag[frag_write_index][5], b_frag[frag_write_index][6], b_frag[frag_write_index][7], b_lds_addr_base + 64 * sizeof(bf16) + b_lds_addr_offset);
         }
 
 #pragma unroll
@@ -502,12 +534,13 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 #pragma unroll
             for (int j = 0; j < 8; ++j)
             {
-                bf162 a_val = *reinterpret_cast<bf162*>(a_frag[frag_read_index] + i);
-                bf162 b_val = *reinterpret_cast<bf162*>(b_frag[frag_read_index] + j);
-                c_frag[2 * i + 0][2 * j + 0] = __hmul(a_val.x, b_val.x);
-                c_frag[2 * i + 0][2 * j + 1] = __hmul(a_val.x, b_val.y);
-                c_frag[2 * i + 1][2 * j + 0] = __hmul(a_val.y, b_val.x);
-                c_frag[2 * i + 1][2 * j + 1] = __hmul(a_val.y, b_val.y);
+                bf162 a_val = a_frag[frag_read_index] + i;
+                bf162 b_val = b_frag[frag_read_index] + j;
+
+                c_frag[2 * i + 0][2 * j + 0] = __hadd(c_frag[2 * i + 0][2 * j + 0], __hmul(a_val.x, b_val.x));
+                c_frag[2 * i + 0][2 * j + 1] = __hadd(c_frag[2 * i + 0][2 * j + 1], __hmul(a_val.x, b_val.y));
+                c_frag[2 * i + 1][2 * j + 0] = __hadd(c_frag[2 * i + 1][2 * j + 0], __hmul(a_val.y, b_val.x));
+                c_frag[2 * i + 1][2 * j + 1] = __hadd(c_frag[2 * i + 1][2 * j + 1], __hmul(a_val.y, b_val.y));
             }
         }
     }
@@ -519,7 +552,7 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 #pragma unroll
         for (int j = 0; j < 4; ++j)
         {
-            Stg128(__bfloat162float(c_frag[i][4 * j]), __bfloat162float(c_frag[i][4 * j + 1]), __bfloat162float(c_frag[i][4 * j + 2]), __bfloat162float(c_frag[i][4 * j + 3]), c + c_stg_addr_base + (i % 8) * n + (i / 8) * 32 * n + (j / 2) * 64);
+            Stg128(__bfloat162float(c_frag[i][4 * j]), __bfloat162float(c_frag[i][4 * j + 1]), __bfloat162float(c_frag[i][4 * j + 2]), __bfloat162float(c_frag[i][4 * j + 3]), c + c_stg_addr_base + (i % 8) * n * 2 + (i / 8) * 32 * n * 2 + (j / 2) * 64 + 4 * j);
         }
     }
 }
@@ -900,6 +933,7 @@ cudaError_t addWithCuda(float* c, const bf16* a, const bf16* b, unsigned int siz
     bf16* dev_b = 0;
     float* dev_c = 0;
     cudaError_t cudaStatus;
+    std::vector<float> c_ref;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
     cudaStatus = cudaSetDevice(0);
@@ -941,12 +975,12 @@ cudaError_t addWithCuda(float* c, const bf16* a, const bf16* b, unsigned int siz
     }
 
 
-    int m = 4096;
-    int n = 4096;
-    int k = 4096;
+    int m = 256;
+    int n = 256;
+    int k = 256;
 	dim3 grid((n + 255) / 256, (m + 255) / 256);
     // Launch a kernel on the GPU with one thread for each element.
-    GemmBf16Shape256x256x8<1, 0, 0> << <grid, 256 >> > (dev_a, dev_b, m, n, k, dev_c);
+    GemmBf16Shape256x256x8<0, 0, 0> << <grid, 256 >> > (dev_a, dev_b, m, n, k, dev_c);
 
     cudaEvent_t start, end;
     cudaStatus = cudaEventCreate(&start);
@@ -958,7 +992,7 @@ cudaError_t addWithCuda(float* c, const bf16* a, const bf16* b, unsigned int siz
     for (int i = 0; i < 10; ++i)
     {
         // Launch a kernel on the GPU with one thread for each element.
-        GemmBf16Shape256x256x8<1, 0, 0> << <grid, 256 >> > (dev_a, dev_b, m, n, k, dev_c);
+        GemmBf16Shape256x256x8<0, 0, 0> << <grid, 256 >> > (dev_a, dev_b, m, n, k, dev_c);
     }
 
     cudaStatus = cudaEventRecord(end);
@@ -995,6 +1029,8 @@ cudaError_t addWithCuda(float* c, const bf16* a, const bf16* b, unsigned int siz
         goto Error;
     }
 
+	c_ref.resize(m * n);
+	memcpy(c_ref.data(), c, m * n * sizeof(float));
     bool chk = check(a, b, c, m, n, k);
     printf("Matrix_C check: %s\n", chk ? "OK" : "Failed");
 
@@ -1008,13 +1044,18 @@ Error:
 
 int main()
 {
-    const int arraySize = 4096 * 4096;
+    const int arraySize = 256 * 256;
     bf16* a = new bf16[arraySize];
     bf16* b = new bf16[arraySize];
     float* c = new float[arraySize];
 
     random_init(a, arraySize);
     random_init(b, arraySize);
+    for (int i = 0; i < arraySize; ++i)
+    {
+        a[i] = __float2bfloat16(1);
+        b[i] = __float2bfloat16(1);
+    }
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
