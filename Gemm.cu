@@ -6,6 +6,7 @@
 #include <mma.h>
 #include <stdio.h>
 #include <vector>
+#include <type_traits>
 
 using namespace nvcuda;
 using bf16 = __nv_bfloat16;
@@ -69,15 +70,15 @@ inline int _ConvertSMVer2Cores(int major, int minor) {
     return nGpuArchCoresPerSM[index - 1].Cores;
 }
 
-__device__ __forceinline__ 
+__device__ __forceinline__
 uint32_t SMemPtr2Addr(void* ptr)
 {
     uint32_t addr;
-    asm ("{.reg .u64 addr64;\n"
+    asm("{.reg .u64 addr64;\n"
         "cvta.to.shared.u64 addr64, %1;\n"
         "cvt.u32.u64 %0, addr64;}\n"
-        :"=r"(addr) 
-        :"l"(ptr)
+        :"=r"(addr)
+        : "l"(ptr)
     );
 
     return addr;
@@ -86,13 +87,13 @@ uint32_t SMemPtr2Addr(void* ptr)
 __device__ __forceinline__
 float* SMemAddr2Ptr(uint32_t addr) {
     uint64_t ptr64;
-    asm (
+    asm(
         "{ .reg .u64 u64addr;\n"
-        "  cvt.u64.u32 u64addr, %1;\n"     
-        "  cvta.shared.u64 %0, u64addr; }\n" 
+        "  cvt.u64.u32 u64addr, %1;\n"
+        "  cvta.shared.u64 %0, u64addr; }\n"
         : "=l"(ptr64)
         : "r"(addr)
-        );
+    );
     return reinterpret_cast<float*>(ptr64);
 }
 
@@ -102,8 +103,8 @@ void Ldgsts32(uint32_t smem_addr, const void* gmem_ptr)
     asm volatile(
         "cp.async.ca.shared.global [%0], [%1], 4;\n"
         :
-        :"r"(smem_addr), "l"(gmem_ptr)
-	);
+    : "r"(smem_addr), "l"(gmem_ptr)
+        );
 }
 
 __device__ __forceinline
@@ -112,8 +113,8 @@ void Ldgsts128(uint32_t smem_addr, const void* gmem_ptr)
     asm volatile(
         "cp.async.ca.shared.global [%0], [%1], 16;\n"
         :
-        :"r"(smem_addr), "l"(gmem_ptr)
-    );
+    : "r"(smem_addr), "l"(gmem_ptr)
+        );
 }
 
 __device__ __forceinline__
@@ -130,28 +131,60 @@ void Ldg32(float& v, const void* addr, bool guard)
         " setp.ne.s32 p, %2, 0;\n"
         "@p ld.global.f32 %0, [%1];}\n"
         :"=f"(v)
-        :"l"(addr), "r"((int)guard)
-    );
+        : "l"(addr), "r"((int)guard)
+        );
 }
 
+template<typename T, typename = std::enable_if_t<!std::is_pointer_v<T>, void>>
 __device__ __forceinline__
-void Ldg32(float& v, const void* addr)
+void Ldg32(T& v, const void* addr)
 {
-    asm volatile(
-        "ld.global.f32 %0, [%1];\n"
-        :"=f"(v)
-        :"l"(addr)
-    );
+    if constexpr (std::is_same_v<T, float>)
+    {
+        asm volatile(
+            "ld.global.f32 %0, [%1];\n"
+            :"=f"(v)
+            : "l"(addr)
+            );
+    }
+    else if constexpr (std::is_same_v<T, bf162>)
+    {
+        float r;
+        Ldg32(r, addr);
+        v = *reinterpret_cast<bf162*>(&r);
+    }
+    else
+    {
+        // unsupported
+    }
 }
 
+template<typename T, typename = std::enable_if_t<!std::is_pointer_v<T>, void>>
 __device__ __forceinline__
-void Ldg128(float& v0, float& v1, float& v2, float& v3, const void* addr)
+void Ldg128(T& v0, T& v1, T& v2, T& v3, const void* addr)
 {
-    asm volatile(
-        "ld.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-        :"=f"(v0), "=f"(v1), "=f"(v2), "=f"(v3)
-        :"l"(addr)
-    );
+    if constexpr (std::is_same_v<T, float>)
+    {
+        asm volatile(
+            "ld.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+            :"=f"(v0), "=f"(v1), "=f"(v2), "=f"(v3)
+            : "l"(addr)
+            );
+    }
+    else if constexpr (std::is_same_v<T, bf162>)
+    {
+        float r0, r1, r2, r3;
+        Ldg128(r0, r1, r2, r3, addr);
+
+        v0 = *reinterpret_cast<bf162*>(&r0);
+        v1 = *reinterpret_cast<bf162*>(&r1);
+        v2 = *reinterpret_cast<bf162*>(&r2);
+        v3 = *reinterpret_cast<bf162*>(&r3);
+    }
+    else
+    {
+        // unsupported
+    }
 }
 
 __device__ __forceinline__
@@ -160,8 +193,8 @@ void Stg32(const float& v, void* addr)
     asm volatile(
         "st.global.f32 [%1], %0;\n"
         :
-        :"f"(v), "l"(addr)
-    );
+    : "f"(v), "l"(addr)
+        );
 }
 
 __device__ __forceinline__
@@ -170,48 +203,110 @@ void Stg128(const float& v0, const float& v1, const float& v2, const float& v3, 
     asm volatile(
         "st.global.v4.f32 [%4], {%0, %1, %2, %3};\n"
         :
-        :"f"(v0), "f"(v1), "f"(v2), "f"(v3), "l"(addr)
-    );
+    : "f"(v0), "f"(v1), "f"(v2), "f"(v3), "l"(addr)
+        );
 }
 
+template<typename T, typename = std::enable_if_t<!std::is_pointer_v<T>, void>>
 __device__ __forceinline__
-void Lds32(float& v, uint32_t addr)
+void Lds32(T& v, uint32_t addr)
 {
-    asm volatile(
-        "ld.shared.f32 %0, [%1];\n"
-        :"=f"(v)
-        :"r"(addr)
-    );
+    if constexpr (std::is_same_v<T, float>)
+    {
+        asm volatile(
+            "ld.shared.f32 %0, [%1];\n"
+            :"=f"(v)
+            : "r"(addr)
+            );
+    }
+    else if constexpr (std::is_same_v<T, bf162>)
+    {
+        float r;
+        Lds32(r, addr);
+
+        v = *reinterpret_cast<bf162*>(&r);
+    }
+    else
+    {
+        // unsupported
+    }
 }
 
+template<typename T, typename = std::enable_if_t<!std::is_pointer_v<T>, void>>
 __device__ __forceinline__
-void Lds128(float& v0, float& v1, float& v2, float& v3, uint32_t addr)
+void Lds128(T& v0, T& v1, T& v2, T& v3, uint32_t addr)
 {
-    asm volatile(
-        "ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];\n"
-        :"=f"(v0), "=f"(v1), "=f"(v2), "=f"(v3)
-        :"r"(addr)
-    );
+    if constexpr (std::is_same_v<T, float>)
+    {
+        asm volatile(
+            "ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+            :"=f"(v0), "=f"(v1), "=f"(v2), "=f"(v3)
+            : "r"(addr)
+            );
+    }
+    else if constexpr (std::is_same_v<T, bf162>)
+    {
+        float r0, r1, r2, r3;
+        Lds128(r0, r1, r2, r3, addr);
+
+        v0 = *reinterpret_cast<bf162*>(&r0);
+        v1 = *reinterpret_cast<bf162*>(&r1);
+        v2 = *reinterpret_cast<bf162*>(&r2);
+        v3 = *reinterpret_cast<bf162*>(&r3);
+    }
+    else
+    {
+        // unsupported
+    }
 }
 
+template<typename T, typename = std::enable_if_t<!std::is_pointer_v<T>, void>>
 __device__ __forceinline__
-void Sts32(const float& v, uint32_t addr)
+void Sts32(const T& v, uint32_t addr)
 {
-    asm volatile(
-        "st.shared.f32 [%1], %0;\n"
-        :
-        :"f"(v), "r"(addr)
-    );
+    if constexpr (std::is_same_v<T, float>)
+    {
+        asm volatile(
+            "st.shared.f32 [%1], %0;\n"
+            :
+        : "f"(v), "r"(addr)
+            );
+    }
+    else if constexpr (std::is_same_v<T, bf162>)
+    {
+        float vf = *reinterpret_cast<const float*>(&v);
+        Sts32(vf, addr);
+    }
+    else
+    {
+        // unsupported
+    }
 }
 
+template<typename T, typename = std::enable_if_t<!std::is_pointer_v<T>, void>>
 __device__ __forceinline__
-void Sts128(const float& v0, const float& v1, const float&v2, const float& v3, uint32_t addr)
+void Sts128(const T& v0, const T& v1, const T& v2, const T& v3, uint32_t addr)
 {
-    asm volatile(
-        "st.shared.v4.f32 [%4], {%0, %1, %2, %3};\n"
-        :
-        :"f"(v0), "f"(v1), "f"(v2), "f"(v3), "r"(addr)
-    );
+    if constexpr (std::is_same_v<T, float>)
+    {
+        asm volatile(
+            "st.shared.v4.f32 [%4], {%0, %1, %2, %3};\n"
+            :
+        : "f"(v0), "f"(v1), "f"(v2), "f"(v3), "r"(addr)
+            );
+    }
+    else if constexpr (std::is_same_v<T, bf162>)
+    {
+        float vf0 = *reinterpret_cast<const float*>(&v0);
+        float vf1 = *reinterpret_cast<const float*>(&v1);
+        float vf2 = *reinterpret_cast<const float*>(&v2);
+        float vf3 = *reinterpret_cast<const float*>(&v3);
+        Lds128(vf0, vf1, vf2, vf3, addr);
+    }
+    else
+    {
+        // unsupported
+    }
 }
 
 __global__ void GemmBf16TensorShape128x128x8(const bf16* a, const bf16* b, int m, int n, int k, float* c)
@@ -227,9 +322,9 @@ __global__ void GemmBf16TensorShape128x128x8(const bf16* a, const bf16* b, int m
 
 /* warp structure
  *
- * 
- * 
- * 
+ *
+ *
+ *
  *    |  128  |
  * ---|-------|-------|
  * 64 | warp0 | warp1 |
@@ -242,7 +337,7 @@ __global__ void GemmBf16TensorShape128x128x8(const bf16* a, const bf16* b, int m
  *    -----------------
  */
 
- /* 
+ /*
   * ------------------------------------------------------------------------------------------------------------------
   * |  t0  |  t1  |  t2  |  t3  |  t4  |  t5  |  t6  |  t7  ||  t0  |  ...                                           |
   * |  t8  |  t9  |  t10 |  t11 |  t12 |  t13 |  t14 |  t15 ||  t8  |  ...                                           |
@@ -294,7 +389,7 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
         {
             b_ldg_addr_base = (block_y * TILE_N) + (warp_id * n) + lane_id * 2;
         }
-        c_stg_addr_base = (block_x * TILE_M * 2) * n * 2 + (block_y * TILE_N * 2) + (warp_id / 2) * 64 * n * 2 + (warp_id % 2) * 128 + (lane_id / 8) * 8 * n * 2 + (lane_id % 8) * 8;
+        c_stg_addr_base = (block_x * TILE_M) * n + (block_y * TILE_N) + (warp_id / 2) * 64 * n + (warp_id % 2) * 128 + (lane_id / 8) * 8 * n + (lane_id % 8) * 8;
 
         a_lds_addr_base = SMemPtr2Addr(a_smem + (warp_id / 2) * 64 + (lane_id / 8) * 8);
         b_lds_addr_base = SMemPtr2Addr(b_smem + (warp_id % 2) * 128 + (lane_id % 8) * 8);
@@ -337,9 +432,9 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
     bf162 a_ldg_reg[4];
     bf162 b_ldg_reg[4];
 
-    bf162 a_frag[2][8] = { 0.f };
-    bf162 b_frag[2][8] = { 0.f };
-    bf16 c_frag[16][16] = { __float2bfloat16(0.f) };
+    bf162 a_frag[2][8] = { bf162(0.f, 0.f) };
+    bf162 b_frag[2][8] = { bf162(0.f, 0.f) };
+    bf16 c_frag[16][16] = { 0.f };
 
 #pragma unroll
     for (int i = 0; i < 4; ++i)
@@ -499,9 +594,9 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 #pragma unroll
                 for (int j = 0; j < 8; ++j)
                 {
-                    bf162 a_val = a_frag[frag_read_index] + i;
-                    bf162 b_val = b_frag[frag_read_index] + j;
-                   
+                    bf162 a_val = a_frag[frag_read_index][i];
+                    bf162 b_val = b_frag[frag_read_index][j];
+
                     c_frag[2 * i + 0][2 * j + 0] = __hadd(c_frag[2 * i + 0][2 * j + 0], __hmul(a_val.x, b_val.x));
                     c_frag[2 * i + 0][2 * j + 1] = __hadd(c_frag[2 * i + 0][2 * j + 1], __hmul(a_val.x, b_val.y));
                     c_frag[2 * i + 1][2 * j + 0] = __hadd(c_frag[2 * i + 1][2 * j + 0], __hmul(a_val.y, b_val.x));
@@ -534,8 +629,8 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 #pragma unroll
             for (int j = 0; j < 8; ++j)
             {
-                bf162 a_val = a_frag[frag_read_index] + i;
-                bf162 b_val = b_frag[frag_read_index] + j;
+                bf162 a_val = a_frag[frag_read_index][i];
+                bf162 b_val = b_frag[frag_read_index][j];
 
                 c_frag[2 * i + 0][2 * j + 0] = __hadd(c_frag[2 * i + 0][2 * j + 0], __hmul(a_val.x, b_val.x));
                 c_frag[2 * i + 0][2 * j + 1] = __hadd(c_frag[2 * i + 0][2 * j + 1], __hmul(a_val.x, b_val.y));
@@ -552,7 +647,7 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
 #pragma unroll
         for (int j = 0; j < 4; ++j)
         {
-            Stg128(__bfloat162float(c_frag[i][4 * j]), __bfloat162float(c_frag[i][4 * j + 1]), __bfloat162float(c_frag[i][4 * j + 2]), __bfloat162float(c_frag[i][4 * j + 3]), c + c_stg_addr_base + (i % 8) * n * 2 + (i / 8) * 32 * n * 2 + (j / 2) * 64 + 4 * j);
+            Stg128(__bfloat162float(c_frag[i][4 * j]), __bfloat162float(c_frag[i][4 * j + 1]), __bfloat162float(c_frag[i][4 * j + 2]), __bfloat162float(c_frag[i][4 * j + 3]), c + c_stg_addr_base + (i % 8) * n + (i / 8) * 32 * n + (j / 2) * 64 + 4 * j);
         }
     }
 }
@@ -573,24 +668,24 @@ __global__ void GemmBf16Shape256x256x8(const bf16* a, const bf16* b, int m, int 
  * -----------------
  */
 
-/* threads structure in warp
- * here we don't process a consecutive 8x8 block per thread, instead for avoiding bank-conflict, the solution as follow, 
- * we have 4 sub-blocks here, each sub-block process 16x32 elements, which means each thread only process 4x4 elements in a sub-block.
- * ------------------------------------------------------------------------------------------------------------------
- * |  t0  |  t1  |  t2  |  t3  |  t4  |  t5  |  t6  |  t7  ||  t0  |  ...                                           |
- * |  t8  |  t9  |  t10 |  t11 |  t12 |  t13 |  t14 |  t15 ||  t8  |  ...                                           |
- * |  t16 |  t17 |  t18 |  t19 |  t20 |  t21 |  t22 |  t23 ||  t16 |  ...                                           |
- * |  t24 |  t25 |  t26 |  t27 |  t28 |  t29 |  t30 |  t31 ||  t24 |  ...                                           |
- * |-------------------------------------------------------||--------------------------------------------------------
- * |  t0  |  ...                                           ||  t0  |  ...                                           |
- * |  t8  |  ...                                           ||  t8  |  ...                                           |
- * |  t16 |  ...                                           ||  t16 |  ...                                           |
- * |  t24 |  ...                                           ||  t24 |  ...                                           |
- * ------------------------------------------------------------------------------------------------------------------
- */
- // sub tile (128, 8) X (8, 128)
- // 256 / 32 = 8 warps
- // 1 thread for processing a tile with 8x8 shape
+ /* threads structure in warp
+  * here we don't process a consecutive 8x8 block per thread, instead for avoiding bank-conflict, the solution as follow,
+  * we have 4 sub-blocks here, each sub-block process 16x32 elements, which means each thread only process 4x4 elements in a sub-block.
+  * ------------------------------------------------------------------------------------------------------------------
+  * |  t0  |  t1  |  t2  |  t3  |  t4  |  t5  |  t6  |  t7  ||  t0  |  ...                                           |
+  * |  t8  |  t9  |  t10 |  t11 |  t12 |  t13 |  t14 |  t15 ||  t8  |  ...                                           |
+  * |  t16 |  t17 |  t18 |  t19 |  t20 |  t21 |  t22 |  t23 ||  t16 |  ...                                           |
+  * |  t24 |  t25 |  t26 |  t27 |  t28 |  t29 |  t30 |  t31 ||  t24 |  ...                                           |
+  * |-------------------------------------------------------||--------------------------------------------------------
+  * |  t0  |  ...                                           ||  t0  |  ...                                           |
+  * |  t8  |  ...                                           ||  t8  |  ...                                           |
+  * |  t16 |  ...                                           ||  t16 |  ...                                           |
+  * |  t24 |  ...                                           ||  t24 |  ...                                           |
+  * ------------------------------------------------------------------------------------------------------------------
+  */
+  // sub tile (128, 8) X (8, 128)
+  // 256 / 32 = 8 warps
+  // 1 thread for processing a tile with 8x8 shape
 
 template<int METHOD, bool VECTORIZATION, bool ASYNC_LOAD>
 __global__ void GemmF32Shape128x128x8(const float* a, const float* b, int m, int n, int k, float* c)
@@ -683,7 +778,7 @@ __global__ void GemmF32Shape128x128x8(const float* a, const float* b, int m, int
     {
         if constexpr (ASYNC_LOAD)
         {
-			Ldgsts32(a_sts_addr_base + i * sizeof(float), a + a_ldg_addr_base + i * k);
+            Ldgsts32(a_sts_addr_base + i * sizeof(float), a + a_ldg_addr_base + i * k);
         }
         else
         {
@@ -751,7 +846,7 @@ __global__ void GemmF32Shape128x128x8(const float* a, const float* b, int m, int
                 {
                     if constexpr (ASYNC_LOAD)
                     {
-						Ldgsts32(a_sts_addr_base + i * sizeof(float), a + a_ldg_addr_base + i * k + tile * TILE_K);
+                        Ldgsts32(a_sts_addr_base + i * sizeof(float), a + a_ldg_addr_base + i * k + tile * TILE_K);
                     }
                     else
                     {
@@ -814,8 +909,8 @@ __global__ void GemmF32Shape128x128x8(const float* a, const float* b, int m, int
                 int sign = (tile % 2 ? 1 : -1);
                 a_sts_addr_base -= 0x2000 * sign;
                 b_sts_addr_base -= 0x1000 * sign;
-				a_lds_addr_base += 0x2000 * sign;
-				b_lds_addr_base += 0x1000 * sign;
+                a_lds_addr_base += 0x2000 * sign;
+                b_lds_addr_base += 0x1000 * sign;
 
                 __syncthreads();
             }
@@ -978,7 +1073,7 @@ cudaError_t addWithCuda(float* c, const bf16* a, const bf16* b, unsigned int siz
     int m = 256;
     int n = 256;
     int k = 256;
-	dim3 grid((n + 255) / 256, (m + 255) / 256);
+    dim3 grid((n + 255) / 256, (m + 255) / 256);
     // Launch a kernel on the GPU with one thread for each element.
     GemmBf16Shape256x256x8<0, 0, 0> << <grid, 256 >> > (dev_a, dev_b, m, n, k, dev_c);
 
@@ -988,7 +1083,7 @@ cudaError_t addWithCuda(float* c, const bf16* a, const bf16* b, unsigned int siz
 
     cudaStatus = cudaEventRecord(start);
 
-	int n_iter = 10;
+    int n_iter = 10;
     for (int i = 0; i < 10; ++i)
     {
         // Launch a kernel on the GPU with one thread for each element.
@@ -1029,8 +1124,8 @@ cudaError_t addWithCuda(float* c, const bf16* a, const bf16* b, unsigned int siz
         goto Error;
     }
 
-	c_ref.resize(m * n);
-	memcpy(c_ref.data(), c, m * n * sizeof(float));
+    c_ref.resize(m * n);
+    memcpy(c_ref.data(), c, m * n * sizeof(float));
     bool chk = check(a, b, c, m, n, k);
     printf("Matrix_C check: %s\n", chk ? "OK" : "Failed");
 
@@ -1070,7 +1165,7 @@ int main()
     }
 
     double theory_gflops = prop.multiProcessorCount * _ConvertSMVer2Cores(prop.major, prop.minor) * (prop.clockRate / 1e6) * 2;
-	printf("theory gflops: %fGFlops\n", theory_gflops);
+    printf("theory gflops: %fGFlops\n", theory_gflops);
 
     // Add vectors in parallel.
     cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
